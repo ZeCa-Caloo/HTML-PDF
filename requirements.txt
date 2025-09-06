@@ -6,3 +6,7 @@ weasyprint
 cffi
 cairocffi
 Pillow
+mammoth
+openpyxl
+xlrd
+pypdf

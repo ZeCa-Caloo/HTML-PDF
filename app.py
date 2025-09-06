@@ -1,12 +1,14 @@
 import streamlit as st
 import pandas as pd
 from pathlib import Path
-import tempfile, os, sys, io, re
+import tempfile, os, sys, io, re, base64
 from html import unescape
+from PIL import Image  # para imagens -> PDF
 
-st.set_page_config(page_title="Converter HTML/XLS(X) ➜ PDF", page_icon="🧾", layout="centered")
-st.title("🧾 Converter HTML/XLS(X) ➜ PDF")
-st.caption("Envie arquivos .html, .htm, .xls ou .xlsx e receba um PDF.")
+st.set_page_config(page_title="Converter para PDF", page_icon="🧾", layout="centered")
+st.title("🧾 Converter HTML/XLS(X)/DOCX/Imagens ➜ PDF")
+st.caption("Envie .html, .htm, .xls, .xlsx, .docx ou imagens (jpg/png/gif/bmp/tiff/webp/svg) e receba um PDF. "
+           "Agora também é possível enviar vários arquivos e gerar um único PDF.")
 
 # -----------------------
 # Info de ambiente
@@ -25,17 +27,20 @@ engine = st.sidebar.selectbox("Motor de PDF", ["WeasyPrint (preservar layout)", 
 preserve_layout = st.sidebar.checkbox("Preservar layout do HTML (usar CSS do documento)", True)
 page_size = st.sidebar.selectbox("Tamanho da página (se NÃO preservar layout)", ["A4", "Letter"], index=0)
 orientation = st.sidebar.selectbox("Orientação (se NÃO preservar layout)", ["portrait", "landscape"], index=0)
-
-# Margens laterais simétricas
 margin_mm = st.sidebar.slider("Margem lateral (mm) – esquerda = direita", 5, 25, 10)
-
 paginate_sheets = st.sidebar.checkbox("Quebrar página entre planilhas (Excel)", True)
+
+# Unir múltiplos
+combine_all = st.sidebar.checkbox("Unir todos os arquivos em um único PDF", True)
 
 # Somente para xhtml2pdf (não preserva CSS moderno)
 sanitize = st.sidebar.checkbox("Sanitizar CSS (apenas xhtml2pdf)", True)
 
-uploaded = st.file_uploader("Envie um arquivo .html, .htm, .xls ou .xlsx",
-                            type=["html", "htm", "xls", "xlsx"])
+uploaded_files = st.file_uploader(
+    "Envie um ou mais arquivos .html, .htm, .xls, .xlsx, .docx ou imagem (jpg/png/gif/bmp/tiff/webp/svg)",
+    type=["html", "htm", "xls", "xlsx", "docx", "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "svg"],
+    accept_multiple_files=True
+)
 
 # -----------------------
 # Sanitização (para xhtml2pdf)
@@ -103,7 +108,6 @@ def sanitize_css(css: str) -> str:
 
 def sanitize_html_for_xhtml2pdf(html: str, page_css: str) -> str:
     html = unescape(html)
-    # injeta @page (xhtml2pdf precisa)
     page_block = f"<style>{page_css}</style>"
     lower = html.lower()
     if "</head>" in lower:
@@ -112,13 +116,11 @@ def sanitize_html_for_xhtml2pdf(html: str, page_css: str) -> str:
     else:
         html = f"<html><head><meta charset='utf-8'>{page_block}</head><body>{html}</body></html>"
 
-    # blocos <style>
     def _clean_style_block(m):
         raw = m.group(1)
         return "<style>" + sanitize_css(raw) + "</style>"
     html = re.sub(r"<style[^>]*>(.*?)</style>", _clean_style_block, html, flags=re.IGNORECASE|re.DOTALL)
 
-    # inline style básico
     def _clean_inline_style(m):
         raw = neutralize_css_functions(m.group(1))
         allowed = []
@@ -167,6 +169,7 @@ def _patch_xhtml2pdf_lower():
 # Leitura do HTML + base_url (para preservar caminhos relativos)
 # -----------------------
 def read_html_and_base(uploaded_file):
+    uploaded_file.seek(0)
     raw = uploaded_file.read()
     try:
         html_str = raw.decode("utf-8")
@@ -178,50 +181,79 @@ def read_html_and_base(uploaded_file):
     fpath = os.path.join(tmpdir, fname)
     with open(fpath, "wb") as f:
         f.write(raw)
-    base_url = tmpdir  # permite que <img src="..."> relativos funcionem
+    base_url = tmpdir
     return html_str, base_url
 
 # -----------------------
-# Helpers para fallback de fontes/emoji (WeasyPrint)
+# Helpers (DOCX/Imagens)
 # -----------------------
-def _strip_emojis(text: str) -> str:
-    # Remove emojis / pictogramas que quebram o HarfBuzz em alguns setups Windows
-    emoji_ranges = [
-        (0x1F600, 0x1F64F),  # Emoticons
-        (0x1F300, 0x1F5FF),  # Símbolos & pictogramas
-        (0x1F680, 0x1F6FF),  # Transporte & mapas
-        (0x2600,  0x26FF),   # Diversos
-        (0x2700,  0x27BF),   # Dingbats
-        (0xFE00,  0xFE0F),   # Variation Selectors
-        (0x1F900, 0x1F9FF),  # Suplemento de pictogramas
-        (0x1FA70, 0x1FAFF),  # Símbolos adicionais
-        (0x1F1E6, 0x1F1FF),  # Bandeiras (pares region)
-    ]
-    out_chars = []
-    for ch in text:
-        cp = ord(ch)
-        if any(start <= cp <= end for start, end in emoji_ranges):
-            continue
-        out_chars.append(ch)
-    return "".join(out_chars)
+def _img_to_data_uri(image):
+    """Usado pelo Mammoth (Python) para embutir imagens do DOCX como data URI."""
+    with image.open() as img_bytes:
+        encoded = base64.b64encode(img_bytes.read()).decode("ascii")
+    return {"src": f"data:{image.content_type};base64,{encoded}"}
+
+def docx_to_html(uploaded_file) -> str:
+    """Converte .docx em HTML com imagens embutidas (API correta do Mammoth em Python)."""
+    try:
+        import mammoth
+    except Exception:
+        st.error("Pacote 'mammoth' não está instalado. Adicione 'mammoth' ao requirements.txt.")
+        st.stop()
+
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    with io.BytesIO(raw) as f:
+        result = mammoth.convert_to_html(
+            f,
+            convert_image=mammoth.images.img_element(_img_to_data_uri)
+        )
+    html = result.value
+    return f"<html><head><meta charset='utf-8'></head><body>{html}</body></html>"
+
+def image_file_to_html(uploaded_file) -> str:
+    """Gera HTML contendo a imagem embutida (data URI), max-width 100%."""
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    try:
+        im = Image.open(io.BytesIO(raw))
+        if im.mode in ("P", "LA", "RGBA", "CMYK"):
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        raw = buf.getvalue()
+        mime = "image/png"
+    except Exception:
+        ext = Path(uploaded_file.name).suffix.lower().lstrip(".")
+        mime = f"image/{'jpeg' if ext in ['jpg','jpeg'] else ext}"
+    b64 = base64.b64encode(raw).decode("ascii")
+    data_uri = f"data:{mime};base64,{b64}"
+    html = f"""
+    <html><head><meta charset="utf-8">
+      <style>
+        html,body{{margin:0;padding:0}}
+        .wrap{{padding:0; margin:0 auto;}}
+        img{{display:block; max-width:100%; height:auto; margin:0 auto;}}
+      </style>
+    </head>
+    <body><div class="wrap"><img src="{data_uri}"/></div></body></html>
+    """
+    return html
 
 # -----------------------
-# Builders
+# Builders (PDF)
 # -----------------------
 def build_pdf_weasy(html_str: str, base_url: str) -> bytes:
     try:
         from weasyprint import HTML, CSS
         try:
-            # WeasyPrint ≥ 60
-            from weasyprint.fonts import FontConfiguration
+            from weasyprint.fonts import FontConfiguration  # >=60
         except Exception:
-            # WeasyPrint 53.x
-            from weasyprint.text.fonts import FontConfiguration
+            from weasyprint.text.fonts import FontConfiguration  # 53.x
     except Exception:
-        st.error("WeasyPrint não está instalado.\nTente:  pip install weasyprint  (ou em conda:  conda install -c conda-forge weasyprint)")
+        st.error("WeasyPrint não está instalado.\nTente: pip install weasyprint (ou conda-forge).")
         st.stop()
 
-    # Garante charset
     if "<meta charset" not in html_str.lower():
         if "<head>" in html_str.lower():
             html_str = html_str.replace("<head>", "<head><meta charset='utf-8'>", 1)
@@ -230,7 +262,6 @@ def build_pdf_weasy(html_str: str, base_url: str) -> bytes:
 
     font_config = FontConfiguration()
 
-    # CSS de margens laterais iguais (não altera o restante do layout)
     if preserve_layout:
         page_css = CSS(string=f"""
             @page {{
@@ -247,7 +278,6 @@ def build_pdf_weasy(html_str: str, base_url: str) -> bytes:
             }}
         """, font_config=font_config)
 
-    # “Cinto de segurança” contra vazamento lateral, sem mexer no design
     safety_css = CSS(string="""
         html, body { overflow: visible !important; }
         * { box-sizing: border-box; min-width: 0 !important; }
@@ -259,7 +289,7 @@ def build_pdf_weasy(html_str: str, base_url: str) -> bytes:
 
     styles = [page_css, safety_css]
 
-    # 1ª tentativa: render normal (preserva layout + margens simétricas)
+    # Primeira tentativa normal
     try:
         pdf_bytes = HTML(string=html_str, base_url=base_url or ".").write_pdf(
             stylesheets=styles, font_config=font_config
@@ -267,31 +297,28 @@ def build_pdf_weasy(html_str: str, base_url: str) -> bytes:
         if pdf_bytes is None:
             raise RuntimeError("WeasyPrint não retornou bytes do PDF.")
         return pdf_bytes
-    except Exception as e1:
-        # 2ª tentativa: força fonte segura e remove emojis problemáticos
-        # (instale fontes pelo conda, se precisar: dejavu-fonts-ttf, liberation-fonts)
+    except Exception:
+        # Fallback de fontes/emoji
+        def _strip_emojis(text: str) -> str:
+            ranges = [(0x1F600,0x1F64F),(0x1F300,0x1F5FF),(0x1F680,0x1F6FF),(0x2600,0x26FF),
+                      (0x2700,0x27BF),(0xFE00,0xFE0F),(0x1F900,0x1F9FF),(0x1FA70,0x1FAFF),(0x1F1E6,0x1F1FF)]
+            out=[]
+            for ch in text:
+                cp=ord(ch)
+                if any(a<=cp<=b for a,b in ranges): continue
+                out.append(ch)
+            return "".join(out)
+
         fallback_font_css = CSS(string="""
-            html, body, * {
-                font-family: "DejaVu Sans", "Liberation Sans", Arial, sans-serif !important;
-                font-variant-ligatures: none;
-            }
+            html, body, * { font-family: "DejaVu Sans", "Liberation Sans", Arial, sans-serif !important; font-variant-ligatures: none; }
         """, font_config=font_config)
-        styles2 = [page_css, safety_css, fallback_font_css]
-
         safe_html = _strip_emojis(html_str)
-
-        try:
-            pdf_bytes = HTML(string=safe_html, base_url=base_url or ".").write_pdf(
-                stylesheets=styles2, font_config=font_config
-            )
-            if pdf_bytes is None:
-                raise RuntimeError("WeasyPrint não retornou bytes do PDF (fallback).")
-            return pdf_bytes
-        except Exception as e2:
-            st.error("Falha ao gerar PDF no WeasyPrint (mesmo no modo de fallback de fontes).")
-            st.exception(e1)  # erro original
-            st.exception(e2)  # erro do fallback
-            st.stop()
+        pdf_bytes = HTML(string=safe_html, base_url=base_url or ".").write_pdf(
+            stylesheets=[page_css, safety_css, fallback_font_css], font_config=font_config
+        )
+        if pdf_bytes is None:
+            raise RuntimeError("WeasyPrint não retornou bytes do PDF (fallback).")
+        return pdf_bytes
 
 def build_pdf_xhtml2pdf(html_str: str) -> bytes:
     try:
@@ -302,7 +329,6 @@ def build_pdf_xhtml2pdf(html_str: str) -> bytes:
 
     _patch_xhtml2pdf_lower()
 
-    # @page com margens laterais iguais também para xhtml2pdf
     page_css = f"@page {{ margin-left: {margin_mm}mm; margin-right: {margin_mm}mm; }}"
     html2 = sanitize_html_for_xhtml2pdf(html_str, page_css) if sanitize or preserve_layout else _inject_page_css(html_str, page_css)
 
@@ -318,9 +344,40 @@ def build_pdf_xhtml2pdf(html_str: str) -> bytes:
         raise RuntimeError("xhtml2pdf falhou após sanitização.")
     return out.getvalue()
 
+def convert_html_to_pdf(html_str: str, base_url: str = ".") -> bytes:
+    if engine.startswith("WeasyPrint"):
+        return build_pdf_weasy(html_str, base_url)
+    else:
+        return build_pdf_xhtml2pdf(html_str)
+
+# -----------------------
+# Excel -> HTML (com engines corretos)
+# -----------------------
 def excel_to_html(uploaded_file, break_between=True) -> str:
+    """Converte .xls/.xlsx para HTML usando o engine correto e checando dependências."""
+    name = uploaded_file.name.lower()
+    uploaded_file.seek(0)
+    data = uploaded_file.read()
+    bio = io.BytesIO(data)
+
+    xls_engine = None
+    if name.endswith(".xlsx"):
+        xls_engine = "openpyxl"
+        try:
+            import openpyxl  # noqa
+        except Exception:
+            st.error("Falta a dependência 'openpyxl' para ler .xlsx. Adicione 'openpyxl' ao requirements.txt e reinstale.")
+            st.stop()
+    elif name.endswith(".xls"):
+        xls_engine = "xlrd"
+        try:
+            import xlrd  # noqa
+        except Exception:
+            st.error("Falta a dependência 'xlrd' para ler .xls. Adicione 'xlrd' ao requirements.txt (>=2.0) e reinstale.")
+            st.stop()
+
     try:
-        xls = pd.ExcelFile(uploaded_file)
+        xls = pd.ExcelFile(bio, engine=xls_engine) if xls_engine else pd.ExcelFile(bio)
     except Exception as e:
         st.exception(e); st.stop()
 
@@ -346,6 +403,7 @@ def excel_to_html(uploaded_file, break_between=True) -> str:
     """
 
 def html_file_to_str(uploaded_file) -> str:
+    uploaded_file.seek(0)
     raw = uploaded_file.read()
     try:
         return raw.decode("utf-8")
@@ -353,39 +411,92 @@ def html_file_to_str(uploaded_file) -> str:
         return raw.decode("latin-1", errors="ignore")
 
 # -----------------------
-# Fluxo principal
+# Merge de múltiplos PDFs
 # -----------------------
-if uploaded:
-    ext = Path(uploaded.name).suffix.lower()
+def merge_pdfs(pdf_bytes_list: list[bytes]) -> bytes:
+    """Une vários PDFs (bytes) em um único PDF."""
+    writer = None
+    # Tenta pypdf primeiro
+    try:
+        from pypdf import PdfReader, PdfWriter
+        writer = PdfWriter()
+    except Exception:
+        try:
+            from PyPDF2 import PdfReader, PdfWriter
+            writer = PdfWriter()
+        except Exception:
+            st.error("Para unir PDFs, instale 'pypdf' ou 'PyPDF2' no requirements.txt.")
+            st.stop()
+
+    for pdf_bytes in pdf_bytes_list:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            writer.add_page(page)
+
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    return out.getvalue()
+
+# -----------------------
+# Processamento por arquivo
+# -----------------------
+def convert_uploaded_file_to_pdf_bytes(file) -> bytes:
+    ext = Path(file.name).suffix.lower()
 
     if ext in [".html", ".htm"]:
-        html_str, base_url = read_html_and_base(uploaded)
-        if engine.startswith("WeasyPrint"):
-            pdf_bytes = build_pdf_weasy(html_str, base_url)
-        else:
-            if preserve_layout:
-                st.info("Para preservar 100% do layout/CSS do documento, prefira o motor WeasyPrint.")
-            pdf_bytes = build_pdf_xhtml2pdf(html_str)
-
-        st.success("HTML convertido com sucesso.")
-        st.download_button("⬇️ Baixar PDF", data=pdf_bytes,
-                           file_name=f"{Path(uploaded.name).stem}.pdf", mime="application/pdf")
+        html_str, base_url = read_html_and_base(file)
+        return convert_html_to_pdf(html_str, base_url)
 
     elif ext in [".xls", ".xlsx"]:
-        html_doc = excel_to_html(uploaded, break_between=paginate_sheets)
-        # Excel vira HTML simples; WeasyPrint preserva, xhtml2pdf usa @page
-        if engine.startswith("WeasyPrint"):
-            pdf_bytes = build_pdf_weasy(html_doc, base_url=".")
-        else:
-            pdf_bytes = build_pdf_xhtml2pdf(html_doc)
+        html_doc = excel_to_html(file, break_between=paginate_sheets)
+        return convert_html_to_pdf(html_doc, base_url=".")
 
-        st.success("Excel convertido com sucesso.")
-        st.download_button("⬇️ Baixar PDF", data=pdf_bytes,
-                           file_name=f"{Path(uploaded.name).stem}.pdf", mime="application/pdf")
+    elif ext == ".docx":
+        html_doc = docx_to_html(file)
+        return convert_html_to_pdf(html_doc, base_url=".")  # imagens embutidas
+
+    elif ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".svg"]:
+        html_doc = image_file_to_html(file)
+        return convert_html_to_pdf(html_doc, base_url=".")
 
     else:
-        st.warning("Formato não suportado. Envie .html, .htm, .xls ou .xlsx.")
+        raise ValueError(f"Formato não suportado: {ext}")
+
+# -----------------------
+# Fluxo principal
+# -----------------------
+if uploaded_files:
+    pdfs = []
+    errors = []
+
+    for f in uploaded_files:
+        try:
+            pdf_bytes = convert_uploaded_file_to_pdf_bytes(f)
+            pdfs.append((f.name, pdf_bytes))
+        except Exception as e:
+            errors.append((f.name, e))
+
+    # mostra erros (se houver) mas segue com os válidos
+    if errors:
+        for name, e in errors:
+            with st.expander(f"⚠️ Falha ao converter: {name}"):
+                st.exception(e)
+
+    if not pdfs:
+        st.warning("Nenhum arquivo pôde ser convertido.")
+        st.stop()
+
+    if combine_all and len(pdfs) > 1:
+        merged_bytes = merge_pdfs([b for _, b in pdfs])
+        st.success(f"Convertidos {len(pdfs)} arquivos e unidos em um único PDF.")
+        st.download_button("⬇️ Baixar PDF único", data=merged_bytes,
+                           file_name="documentos_unificados.pdf", mime="application/pdf")
+    else:
+        st.success(f"Convertidos {len(pdfs)} arquivo(s). Baixe individualmente abaixo.")
+        for idx, (name, b) in enumerate(pdfs, start=1):
+            st.download_button(f"⬇️ Baixar {idx}: {name}.pdf", data=b,
+                               file_name=f"{Path(name).stem}.pdf", mime="application/pdf", key=f"dl_{idx}")
+
 else:
-    st.info("Envie um arquivo para iniciar a conversão.")
-
-
+    st.info("Envie um ou mais arquivos para iniciar a conversão.")

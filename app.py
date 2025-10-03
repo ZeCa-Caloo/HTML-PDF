@@ -501,3 +501,4 @@ if uploaded_files:
 
 else:
     st.info("Envie um ou mais arquivos para iniciar a conversão.")
+

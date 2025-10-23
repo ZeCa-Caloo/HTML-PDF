@@ -1,7 +1,6 @@
 [build-system]
 requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
-
 [project]
 name = "htmlpdf-converter"
 version = "0.1.0"
@@ -19,6 +18,5 @@ dependencies = [
   "xlrd==2.0.1",
   "weasyprint",
 ]
-
 [tool.streamlit]
 server.port = 8501

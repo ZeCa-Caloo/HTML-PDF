@@ -1,8 +1,9 @@
 streamlit==1.50.0
 pandas==2.2.2
 pillow==10.4.0
-mammoth==1.8.0
+mammoth>=1.6.0
 xhtml2pdf==0.2.15
 pypdf==4.3.1
 openpyxl==3.1.5
 xlrd==2.0.1
+reportlab>=4.0.9

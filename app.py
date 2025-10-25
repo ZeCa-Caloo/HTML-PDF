@@ -1,3 +1,7 @@
+import sys, subprocess, streamlit as st
+st.write("Python:", sys.version, "Exec:", sys.executable)
+st.code(subprocess.check_output([sys.executable,"-m","pip","freeze"]).decode())
+
 import streamlit as st
 import pandas as pd
 from pathlib import Path
